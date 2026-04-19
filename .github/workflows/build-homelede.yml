@@ -1,155 +1,79 @@
-name: Build HomeLede x86 EFI (No Docker, IP 192.168.1.5)
+name: 编译 ImmortalWrt 旁路由固件
 
 on:
-  workflow_dispatch:                # 允许手动触发
-  schedule:
-    - cron: '0 8 * * 5'             # 每周五8点自动编译（可选）
+  workflow_dispatch:
+    inputs:
+      ssh_debug:
+        description: '开启 SSH 调试'
+        required: true
+        default: 'false'
+        type: boolean
 
 env:
-  REPO_URL: https://github.com/xiaoqingfengATGH/HomeLede
-  REPO_BRANCH: k5                   # 使用 HomeLede 的 k5 分支
-  CONFIG_FILE: x86-efi.config       # 官方提供的 x86 EFI 配置模板
+  REPO_URL: https://github.com/immortalwrt/immortalwrt.git # 使用 immortalwrt 官方源码
+  REPO_BRANCH: openwrt-25.12 # 推荐使用稳定分支
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: .config
+  TZ: Asia/Shanghai
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
-  TZ: Asia/Shanghai
 
 jobs:
   build:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout (your repo)
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: Initialize build environment
+      - name: 初始化环境
         run: |
-          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          sudo -E apt-get update -qq
-          sudo -E apt-get install -qq $(curl -fsSL git.io/depends-ubuntu-2204)
-          sudo -E apt-get autoremove -qq --purge
-          sudo -E apt-get clean -qq
-          sudo timedatectl set-timezone "$TZ"
-          sudo mkdir -p /workdir
-          sudo chown $USER:$GROUPS /workdir
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+          gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
+          python3-distutils rsync unzip zlib1g-dev file wget
 
-      - name: Clone HomeLede source
-        working-directory: /workdir
+      - name: 克隆源码
         run: |
           git clone $REPO_URL -b $REPO_BRANCH openwrt
-          ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
-
-      - name: Update and install feeds
-        run: |
           cd openwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Load x86-efi configuration
+      - name: 加载自定义配置
         run: |
-          cd openwrt
-          if [ -f "configs/${{ env.CONFIG_FILE }}" ]; then
-            cp "configs/${{ env.CONFIG_FILE }}" .config
-          else
-            make defconfig
-          fi
-
-      - name: Change default LAN IP to 192.168.1.5
-        run: |
-          cd openwrt
-          CONFIG_GEN="package/base-files/files/bin/config_generate"
-          if [ -f "$CONFIG_GEN" ]; then
-            sed -i 's/192\.168\.[0-9]\+\.[0-9]\+/192.168.1.5/g' "$CONFIG_GEN"
-            echo "IP changed to 192.168.1.5"
-          else
-            echo "Warning: config_generate not found, IP may remain default"
-          fi
-
-      - name: Completely remove Docker packages
-        run: |
-          cd openwrt
-          # 从 .config 删除 docker 相关配置
-          sed -i '/docker/d' .config
-          sed -i '/dockerd/d' .config
-          sed -i '/containerd/d' .config
-          sed -i '/runc/d' .config
-          # 物理删除 feeds 中的 docker 目录
-          rm -rf feeds/packages/utils/dockerd
-          rm -rf feeds/packages/utils/docker
-          rm -rf feeds/packages/utils/docker-compose
-          rm -rf feeds/packages/utils/containerd
-          rm -rf feeds/packages/utils/runc
-          rm -rf feeds/luci/applications/luci-app-docker
-          rm -rf feeds/luci/applications/luci-app-dockerman
-          # 重新生成配置并强制禁用 docker 相关包
-          make defconfig
-          for pkg in dockerd docker docker-compose containerd runc; do
-            sed -i "s/CONFIG_PACKAGE_${pkg}=[ym]/CONFIG_PACKAGE_${pkg}=n/" .config
-          done
-          echo "All Docker components removed"
-
-      - name: SSH debug (optional)
-        uses: P3TERX/ssh2actions@v1.0.0
-        if: github.event.inputs.ssh == 'true'
-        env:
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-
-      - name: Download package sources
-        run: |
+          cp -f $GITHUB_WORKSPACE/.config openwrt/.config
           cd openwrt
           make defconfig
-          make download -j8
-          find dl -size -1024c -exec rm -f {} \;
 
-      - name: Compile firmware
-        id: compile
+      - name: 下载编译依赖
         run: |
           cd openwrt
-          echo "Starting compilation with $(nproc) threads"
-          make -j$(nproc) || make -j1 || make -j1 V=s
-          echo "status=success" >> $GITHUB_OUTPUT
-          echo "FILE_DATE=$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+          make download -j$(nproc)
 
-      - name: Prepare firmware files
-        if: steps.compile.outputs.status == 'success' && !cancelled()
+      - name: 编译固件
         run: |
-          cd openwrt/bin/targets/*/*
-          rm -rf packages
-          echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+          cd openwrt
+          make -j$(nproc) V=s
 
-      - name: Upload firmware as artifact
+      - name: 打包固件
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/firmware
+          cp openwrt/bin/targets/x86/64/*.img.gz $GITHUB_WORKSPACE/firmware/ 2>/dev/null || true
+          cp openwrt/bin/targets/x86/64/*.vmdk $GITHUB_WORKSPACE/firmware/ 2>/dev/null || true
+
+      - name: 上传固件 (Artifact)
         uses: actions/upload-artifact@v4
-        if: steps.compile.outputs.status == 'success' && !cancelled()
         with:
-          name: HomeLede_x86_EFI_NoDocker_${{ env.FILE_DATE }}
-          path: ${{ env.FIRMWARE }}
+          name: ImmortalWrt-Firmware
+          path: firmware/
 
-      - name: Create GitHub Release
-        id: create_release
-        if: env.UPLOAD_RELEASE == 'true' && steps.compile.outputs.status == 'success'
-        run: |
-          TAG_NAME="$(date +"%Y.%m.%d-%H%M")"
-          echo "release_tag=$TAG_NAME" >> $GITHUB_OUTPUT
-          cat > release_body.txt <<EOF
-          HomeLede x86 EFI 固件 (无 Docker, LAN IP: 192.168.1.5)
-          编译时间: $(date +"%Y-%m-%d %H:%M:%S %Z")
-          EOF
-
-      - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
-        if: steps.create_release.outputs.release_tag != ''
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: 创建 Release
+        if: success() && env.UPLOAD_RELEASE == 'true'
+        uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ steps.create_release.outputs.release_tag }}
-          body_path: release_body.txt
-          files: ${{ env.FIRMWARE }}/*
-
-      - name: Keep only 3 latest releases
-        uses: dev-drprasad/delete-older-releases@v0.3.4
-        if: env.UPLOAD_RELEASE == 'true'
-        with:
-          keep_latest: 3
-          delete_tags: true
+          tag_name: build-${{ github.run_number }}
+          name: ImmortalWrt 固件构建 #${{ github.run_number }}
+          files: firmware/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
