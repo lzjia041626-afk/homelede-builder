@@ -17,7 +17,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
-      - name: 检出代码（仅用于获取工作流文件）
+      - name: 检出代码
         uses: actions/checkout@v5
 
       - name: 初始化编译环境
@@ -27,24 +27,41 @@ jobs:
           gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
           python3-distutils rsync unzip zlib1g-dev file wget
 
-      - name: 克隆源码（带镜像加速）
+      - name: 克隆源码（不使用任何第三方镜像，直接官方源 + 重试）
         run: |
           git config --global http.postBuffer 524288000
-          git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
+          
+          for i in 1 2 3; do
+            echo "尝试克隆 immortalwrt 源码 (第 $i 次)..."
+            git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt && break
+            echo "克隆失败，等待 10 秒后重试..."
+            sleep 10
+          done
+          
+          if [ ! -d "openwrt" ]; then
+            echo "❌ 源码克隆失败，退出。"
+            exit 1
+          fi
+          
           cd openwrt
-          # 使用 ghproxy 镜像加速 feeds
-          sed -i 's|https://git.openwrt.org/feed/packages.git|https://mirror.ghproxy.com/https://github.com/openwrt/packages.git|g' feeds.conf.default
-          sed -i 's|https://git.openwrt.org/project/luci.git|https://mirror.ghproxy.com/https://github.com/openwrt/luci.git|g' feeds.conf.default
-          sed -i 's|https://github.com/immortalwrt/packages.git|https://mirror.ghproxy.com/https://github.com/immortalwrt/packages.git|g' feeds.conf.default
-          sed -i 's|https://github.com/immortalwrt/luci.git|https://mirror.ghproxy.com/https://github.com/immortalwrt/luci.git|g' feeds.conf.default
-          ./scripts/feeds update -a
+          
+          # 不使用任何镜像加速，直接更新 feeds（增加重试）
+          for i in 1 2 3; do
+            echo "尝试更新 feeds (第 $i 次)..."
+            ./scripts/feeds update -a && break
+            echo "feeds 更新失败，等待 10 秒后重试..."
+            sleep 10
+          done
+          
           ./scripts/feeds install -a
 
       - name: 生成基础配置并增量添加软件包
         run: |
           cd openwrt
           
-          # 1. 生成 x86_64 默认配置
+          # 生成 x86_64 默认配置
           cat > .config <<EOF
           CONFIG_TARGET_x86=y
           CONFIG_TARGET_x86_64=y
@@ -55,7 +72,7 @@ jobs:
           
           make defconfig
           
-          # 2. 使用 sed 追加必须的 LuCI 中文和主题
+          # 追加必须的 LuCI 中文和主题
           echo "CONFIG_PACKAGE_luci=y" >> .config
           echo "CONFIG_PACKAGE_luci-base=y" >> .config
           echo "CONFIG_PACKAGE_luci-compat=y" >> .config
@@ -66,35 +83,30 @@ jobs:
           echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-argon-config=y" >> .config
           
-          # 3. 核心三件套（注意包名必须与 feeds 中完全一致）
-          # mosdns
+          # 核心三件套
           echo "CONFIG_PACKAGE_mosdns=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-mosdns=y" >> .config
           echo "CONFIG_PACKAGE_v2ray-geoip=y" >> .config
           echo "CONFIG_PACKAGE_v2ray-geosite=y" >> .config
           
-          # AdGuardHome
           echo "CONFIG_PACKAGE_adguardhome=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-adguardhome=y" >> .config
           
-          # Nikki (Mihomo)
           echo "CONFIG_PACKAGE_nikki=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-nikki=y" >> .config
           echo "CONFIG_PACKAGE_iptables-mod-tproxy=y" >> .config
           echo "CONFIG_PACKAGE_kmod-nft-tproxy=y" >> .config
           
-          # 4. 运行 defconfig 解析依赖（捕获详细错误）
-          echo "===== 正在解析依赖，如有错误将在此处显示 ====="
+          echo "===== 正在解析依赖（显示详细输出）====="
           make defconfig V=sc 2>&1 | tee defconfig.log
           
-          # 5. 检查是否成功
           if grep -q "Error" defconfig.log; then
-            echo "❌ 配置阶段出现错误，请查看上方日志。"
+            echo "❌ 配置阶段出现错误。"
             exit 1
           fi
           
-          echo "✅ 配置解析完成，当前选中包如下："
-          grep -E "^CONFIG_PACKAGE_(mosdns|adguardhome|nikki|luci-app-mosdns|luci-app-adguardhome|luci-app-nikki)=" .config
+          echo "✅ 配置解析完成。已选中以下核心包："
+          grep -E "^CONFIG_PACKAGE_(mosdns|adguardhome|nikki|luci-app-mosdns|luci-app-adguardhome|luci-app-nikki)=" .config || echo "警告：部分核心包未选中，请检查包名。"
 
       - name: 下载编译依赖
         run: |
