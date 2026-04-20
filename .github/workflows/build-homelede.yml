@@ -6,7 +6,6 @@ on:
 env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt.git
   REPO_BRANCH: openwrt-23.05
-  CONFIG_FILE: .config
   TZ: Asia/Shanghai
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
@@ -18,7 +17,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
-      - name: 检出代码
+      - name: 检出代码（仅用于获取工作流文件）
         uses: actions/checkout@v5
 
       - name: 初始化编译环境
@@ -41,20 +40,61 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 加载配置并诊断包依赖
+      - name: 生成基础配置并增量添加软件包
         run: |
-          cp -f $GITHUB_WORKSPACE/.config openwrt/.config
           cd openwrt
           
-          echo "===== 1. 执行 make defconfig ====="
+          # 1. 生成 x86_64 默认配置
+          cat > .config <<EOF
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_DEVICE_generic=y
+          CONFIG_TARGET_ROOTFS_EXT4FS=y
+          CONFIG_TARGET_ROOTFS_TARGZ=y
+          EOF
+          
           make defconfig
           
-          echo "===== 2. 检查缺失的依赖包 ====="
-          # 输出所有未被满足的依赖（这是最常见失败原因）
-          make package/compile 2>&1 | grep -i "missing\|unmet\|not found" || echo "未发现明显缺失依赖"
+          # 2. 使用 sed 追加必须的 LuCI 中文和主题
+          echo "CONFIG_PACKAGE_luci=y" >> .config
+          echo "CONFIG_PACKAGE_luci-base=y" >> .config
+          echo "CONFIG_PACKAGE_luci-compat=y" >> .config
+          echo "CONFIG_PACKAGE_luci-ssl=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-opkg-zh-cn=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y" >> .config
+          echo "CONFIG_PACKAGE_luci-theme-argon=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-argon-config=y" >> .config
           
-          echo "===== 3. 列出将被编译的核心包 ====="
-          grep -E "^CONFIG_PACKAGE_(mosdns|adguardhome|nikki|luci-app-mosdns|luci-app-adguardhome|luci-app-nikki)=" .config || echo "警告：部分核心包未选中"
+          # 3. 核心三件套（注意包名必须与 feeds 中完全一致）
+          # mosdns
+          echo "CONFIG_PACKAGE_mosdns=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-mosdns=y" >> .config
+          echo "CONFIG_PACKAGE_v2ray-geoip=y" >> .config
+          echo "CONFIG_PACKAGE_v2ray-geosite=y" >> .config
+          
+          # AdGuardHome
+          echo "CONFIG_PACKAGE_adguardhome=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-adguardhome=y" >> .config
+          
+          # Nikki (Mihomo)
+          echo "CONFIG_PACKAGE_nikki=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-nikki=y" >> .config
+          echo "CONFIG_PACKAGE_iptables-mod-tproxy=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-nft-tproxy=y" >> .config
+          
+          # 4. 运行 defconfig 解析依赖（捕获详细错误）
+          echo "===== 正在解析依赖，如有错误将在此处显示 ====="
+          make defconfig V=sc 2>&1 | tee defconfig.log
+          
+          # 5. 检查是否成功
+          if grep -q "Error" defconfig.log; then
+            echo "❌ 配置阶段出现错误，请查看上方日志。"
+            exit 1
+          fi
+          
+          echo "✅ 配置解析完成，当前选中包如下："
+          grep -E "^CONFIG_PACKAGE_(mosdns|adguardhome|nikki|luci-app-mosdns|luci-app-adguardhome|luci-app-nikki)=" .config
 
       - name: 下载编译依赖
         run: |
