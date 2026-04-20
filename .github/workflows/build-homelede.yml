@@ -5,7 +5,7 @@ on:
 
 env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt.git
-  REPO_BRANCH: openwrt-23.05          # 稳定分支
+  REPO_BRANCH: openwrt-23.05
   CONFIG_FILE: .config
   TZ: Asia/Shanghai
   UPLOAD_FIRMWARE: true
@@ -15,11 +15,11 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # 强制使用 Node.js 24，消除警告
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v5                 # 升级至 v5
+        uses: actions/checkout@v5
 
       - name: 初始化编译环境
         run: |
@@ -28,30 +28,37 @@ jobs:
           gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
           python3-distutils rsync unzip zlib1g-dev file wget
 
-      - name: 克隆源码并加速下载
+      - name: 克隆源码（带镜像加速）
         run: |
-          git clone $REPO_URL -b $REPO_BRANCH openwrt
+          git config --global http.postBuffer 524288000
+          git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
           cd openwrt
-          # 使用国内镜像加速 feeds 下载
-          sed -i 's/https:\/\/git.openwrt.org\/feed\/packages.git/https:\/\/mirrors.tuna.tsinghua.edu.cn\/openwrt\/packages.git/g' feeds.conf.default
-          sed -i 's/https:\/\/git.openwrt.org\/project\/luci.git/https:\/\/mirrors.tuna.tsinghua.edu.cn\/openwrt\/luci.git/g' feeds.conf.default
-          sed -i 's/https:\/\/github.com\/immortalwrt\/packages.git/https:\/\/mirror.ghproxy.com\/https:\/\/github.com\/immortalwrt\/packages.git/g' feeds.conf.default
-          sed -i 's/https:\/\/github.com\/immortalwrt\/luci.git/https:\/\/mirror.ghproxy.com\/https:\/\/github.com\/immortalwrt\/luci.git/g' feeds.conf.default
+          # 使用 ghproxy 镜像加速 feeds
+          sed -i 's|https://git.openwrt.org/feed/packages.git|https://mirror.ghproxy.com/https://github.com/openwrt/packages.git|g' feeds.conf.default
+          sed -i 's|https://git.openwrt.org/project/luci.git|https://mirror.ghproxy.com/https://github.com/openwrt/luci.git|g' feeds.conf.default
+          sed -i 's|https://github.com/immortalwrt/packages.git|https://mirror.ghproxy.com/https://github.com/immortalwrt/packages.git|g' feeds.conf.default
+          sed -i 's|https://github.com/immortalwrt/luci.git|https://mirror.ghproxy.com/https://github.com/immortalwrt/luci.git|g' feeds.conf.default
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 加载自定义配置
+      - name: 加载配置并诊断包依赖
         run: |
           cp -f $GITHUB_WORKSPACE/.config openwrt/.config
           cd openwrt
+          
+          echo "===== 1. 执行 make defconfig ====="
           make defconfig
+          
+          echo "===== 2. 检查缺失的依赖包 ====="
+          # 输出所有未被满足的依赖（这是最常见失败原因）
+          make package/compile 2>&1 | grep -i "missing\|unmet\|not found" || echo "未发现明显缺失依赖"
+          
+          echo "===== 3. 列出将被编译的核心包 ====="
+          grep -E "^CONFIG_PACKAGE_(mosdns|adguardhome|nikki|luci-app-mosdns|luci-app-adguardhome|luci-app-nikki)=" .config || echo "警告：部分核心包未选中"
 
-      - name: 下载编译依赖（带重试与加速）
+      - name: 下载编译依赖
         run: |
           cd openwrt
-          # 设置下载镜像站为国内源
-          export DOWNLOAD_MIRROR="https://mirrors.tuna.tsinghua.edu.cn/openwrt"
-          # 增加重试次数避免 "Too many retries"
           make download -j$(nproc) V=s DOWNLOAD_RETRIES=10
 
       - name: 编译固件
@@ -66,14 +73,14 @@ jobs:
           cp openwrt/bin/targets/x86/64/*.vmdk $GITHUB_WORKSPACE/firmware/ 2>/dev/null || true
 
       - name: 上传固件 (Artifact)
-        uses: actions/upload-artifact@v5           # 升级至 v5
+        uses: actions/upload-artifact@v5
         with:
           name: ImmortalWrt-Firmware
           path: firmware/
 
       - name: 创建 Release
         if: success() && env.UPLOAD_RELEASE == 'true'
-        uses: softprops/action-gh-release@v2      # 升级至 v2
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
           name: ImmortalWrt 固件构建 #${{ github.run_number }}
